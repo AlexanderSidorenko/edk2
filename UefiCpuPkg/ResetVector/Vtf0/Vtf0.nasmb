@@ -1,6 +1,28 @@
 ;------------------------------------------------------------------------------
 ; @file
-; This file includes all other code files to assemble the reset vector code
+; Master assembly file for the VTF-0 (Volume Top File) reset vector module.
+;
+; This file %includes all other source files in a specific order to produce
+; a single binary blob that gets placed at the very top of the firmware ROM
+; (just below the 4GB boundary at 0x100000000).
+;
+; INCLUDE ORDER MATTERS:
+;   - Data/macro definitions come first (CommonMacros, PostCodes, PageTables)
+;   - Static page tables are emitted early (they occupy the lowest addresses)
+;   - Subroutine code follows (search routines, mode transitions)
+;   - Main orchestrator comes near the end
+;   - Reset vector entry point is LAST (it must be at 0xFFFFFFF0)
+;
+; The resulting binary layout in physical memory (high addresses at bottom):
+;
+;   [StartOfResetVectorCode]     <-- Lowest address of this code
+;     Page tables (if x64)
+;     Debug support code
+;     Search routines (BFV, SEC)
+;     Mode transition code (16->32, 32->64)
+;     Main16 orchestrator
+;     VTF signature + Reset Vector  <-- At 0xFFFFFFF0
+;   [fourGigabytes]              <-- 0x100000000
 ;
 ; Copyright (c) 2008 - 2023, Intel Corporation. All rights reserved.<BR>
 ; SPDX-License-Identifier: BSD-2-Clause-Patent
@@ -8,8 +30,9 @@
 ;------------------------------------------------------------------------------
 
 ;
-; If neither ARCH_IA32 nor ARCH_X64 are defined, then try to include
-; Base.h to use the C pre-processor to determine the architecture.
+; Architecture detection: determine if building for IA-32 or x64.
+; If neither ARCH_IA32 nor ARCH_X64 is defined on the command line,
+; fall back to C preprocessor macros from the edk2 build system.
 ;
 %ifndef ARCH_IA32
   %ifndef ARCH_X64
@@ -22,6 +45,7 @@
   %endif
 %endif
 
+; Sanity check: exactly one architecture must be defined.
 %ifdef ARCH_IA32
   %ifdef ARCH_X64
     %error "Only one of ARCH_IA32 or ARCH_X64 can be defined."
@@ -31,16 +55,23 @@
   %error "Either ARCH_IA32 or ARCH_X64 must be defined."
 %endif
 
-%include "CommonMacros.inc"
+; === Macro and constant definitions ===
+%include "CommonMacros.inc"         ; OneTimeCall/Ret macros, ADDR_OF/ADDR16_OF
+%include "PostCodes.inc"            ; Debug POST code constants
+%include "PageTables.inc"           ; Page table entry bit definitions
 
-%include "PostCodes.inc"
-
-%include "PageTables.inc"
-
+; === Static page tables (x64 only) ===
+; These are emitted as raw data at the start of the binary (lowest addresses).
+; They create an identity map (virtual == physical) for 0-4GB or 0-512GB.
 %ifdef ARCH_X64
   %include "X64/PageTables.nasm.inc"
 %endif
 
+; === Debug output support ===
+; Exactly one debug backend is included based on build defines.
+; DEBUG_PORT80: Output POST codes to I/O port 0x80 (POST code card)
+; DEBUG_SERIAL: Output POST codes as hex to COM1 serial port
+; (default):    No debug output (production builds)
 %ifdef DEBUG_PORT80
   %include "Port80Debug.nasm.inc"
 %elifdef DEBUG_SERIAL
@@ -49,18 +80,23 @@
   %include "DebugDisabled.nasm.inc"
 %endif
 
-%include "Ia32/SearchForBfvBase.nasm.inc"
-%include "Ia32/SearchForSecEntry.nasm.inc"
+; === 32-bit subroutines (run after transition to protected mode) ===
+%include "Ia32/SearchForBfvBase.nasm.inc"     ; Scan flash for firmware volume
+%include "Ia32/SearchForSecEntry.nasm.inc"     ; Find SEC core in FFS filesystem
 
+; === 64-bit transition support (x64 only) ===
 %ifdef ARCH_X64
-%include "Ia32/Flat32ToFlat64.nasm.inc"
-%include "Ia32/PageTables64.nasm.inc"
+%include "Ia32/Flat32ToFlat64.nasm.inc"       ; Protected mode -> long mode
+%include "Ia32/PageTables64.nasm.inc"          ; Set CR3 to page table base
 %endif
 
-%include "Ia16/Real16ToFlat32.nasm.inc"
-%include "Ia16/Init16.nasm.inc"
+; === 16-bit subroutines (run in real mode) ===
+%include "Ia16/Real16ToFlat32.nasm.inc"       ; Real mode -> protected mode + GDT
+%include "Ia16/Init16.nasm.inc"               ; BSP identification, BIST save
 
-%include "Main.nasm.inc"
+; === Main orchestrator ===
+%include "Main.nasm.inc"                      ; Calls everything in sequence, jumps to SEC
 
-%include "Ia16/ResetVectorVtf0.nasm.inc"
+; === Reset vector entry point (MUST BE LAST — maps to 0xFFFFFFF0) ===
+%include "Ia16/ResetVectorVtf0.nasm.inc"      ; VTF signature + reset vector jump
 
